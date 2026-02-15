@@ -1,0 +1,34 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+
+# Environment / Sensitive
+.env
+config.json
+
+# Project Specific
+# input, temp, output は個人データや一時的な生成物のため除外
+input/*
+!input/.gitkeep
+temp/*
+!temp/.gitkeep
+output/*
+!output/.gitkeep
+
+# OS
+.DS_Store
+Thumbs.db
+
+# VS Code
+.vscode/
+
+# Backup files
+*.bak
+*.bak[0-9]*
+*~
+*.old
+*.tmp
+*.log
