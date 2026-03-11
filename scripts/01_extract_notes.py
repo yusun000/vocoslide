@@ -1,6 +1,7 @@
 import os
 import json
 import sys
+import re
 
 # プロジェクトルートをパスに追加
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -20,6 +21,45 @@ def apply_dictionary(text, dictionary):
         text = text.replace(key, dictionary[key])
     return text
 
+def split_long_text(text, max_len=35):
+    """
+    1. 元々ある '//' や '／／' を最優先の分割点とする
+    2. 分割された各区間が max_len を超える場合のみ、句読点ベースで自動分割する
+    """
+    # 元々の分割記号（半角/全角）で一度リスト化
+    user_segments = re.split(r'//|／／', text)
+    final_results = []
+
+    for segment in user_segments:
+        segment = segment.strip()
+        if not segment:
+            continue
+
+        # 手動分割された区間が制限文字数内の場合はそのまま採用
+        if len(segment) <= max_len:
+            final_results.append(segment)
+        else:
+            # 制限を超えている場合のみ自動分割ロジックを適用
+            # 句読点（。、？！）や空白で分割を試みる
+            delimiters = r'([。、？！?!\s])'
+            chunks = re.split(delimiters, segment)
+            
+            current_line = ""
+            for chunk in chunks:
+                if not chunk: continue
+                # 次の塊を足すと制限を超える場合、現在の行を確定
+                if len(current_line) + len(chunk) > max_len and current_line:
+                    final_results.append(current_line.strip())
+                    current_line = chunk
+                else:
+                    current_line += chunk
+            
+            if current_line:
+                final_results.append(current_line.strip())
+
+    # 全てを全角 '／／' で繋ぎ直す
+    return "／／".join(final_results)
+
 def main():
     if len(sys.argv) < 2:
         print("使用法: python 01_extract_notes.py [PPTXパス]")
@@ -31,6 +71,10 @@ def main():
     dict_path = "dict/custom_dict.json"
     output_json = "temp/notes.json"
     check_file = "temp/check_notes.txt"
+    
+    # --- 設定値 ---
+    MAX_CHARS_PER_LINE = 35  # 1行あたりの最大文字数
+    # --------------
 
     print(f"--- ステップ01: ノート抽出開始 ({os.path.basename(pptx_path)}) ---")
 
@@ -40,37 +84,40 @@ def main():
         dictionary = load_dictionary(dict_path)
 
         formatted_notes = []
-        
+        os.makedirs("temp", exist_ok=True)
+
         with open(check_file, "w", encoding="utf-8-sig") as f_check:
-            f_check.write("# 抽出されたノートです。字幕は漢字、読上はひらがな等で管理されます。\n")
-            f_check.write("# 必要に応じて「読上:」の行を修正してください。\n\n")
+            f_check.write("# 抽出されたノートです。'／／' は改行・分割位置を示します。\n")
+            f_check.write("# 手動の // も反映済みです。必要に応じて修正してください。\n\n")
 
             for i, raw_text in enumerate(raw_notes):
                 page_num = i + 1
-                original_text = raw_text.strip()
-                # 辞書適用（読み上げ用）
-                reading_text = apply_dictionary(raw_text, dictionary).strip()
+                # 元の改行をスペースに置換（手動の // は維持される）
+                clean_text = raw_text.strip().replace('\n', ' ')
                 
-                # 新しいデータ構造: text(字幕用) と reading(読み上げ用) を分ける
+                # 1. 辞書適用（読み上げ用）
+                reading_base = apply_dictionary(clean_text, dictionary)
+                
+                # 2. 手動分割優先 ＋ 自動分割
+                final_subtitle = split_long_text(clean_text, max_len=MAX_CHARS_PER_LINE)
+                final_reading = split_long_text(reading_base, max_len=MAX_CHARS_PER_LINE)
+                
                 formatted_notes.append({
                     "slide_number": page_num,
-                    "text": original_text,
-                    "reading": reading_text
+                    "text": final_subtitle,
+                    "reading": final_reading
                 })
                 
-                # 確認用ファイルの書き出し（対比しやすい形式）
                 f_check.write(f"--- PAGE_{page_num:03d} ---\n")
-                f_check.write(f"字幕: {original_text}\n")
-                f_check.write(f"読上: {reading_text}\n\n")
+                f_check.write(f"字幕: {final_subtitle}\n")
+                f_check.write(f"読上: {final_reading}\n\n")
 
         # JSON保存
-        os.makedirs("temp", exist_ok=True)
         with open(output_json, "w", encoding="utf-8") as f_json:
             json.dump(formatted_notes, f_json, ensure_ascii=False, indent=4)
 
         print(f"成功: {len(formatted_notes)} 枚のノートを処理しました。")
-        print(f"中間データ: {output_json}")
-        print(f"確認用ファイル: {check_file}")
+        print(f"設定: 最大 {MAX_CHARS_PER_LINE} 文字 (手動分割優先)")
 
     except Exception as e:
         print(f"エラー: {e}")
