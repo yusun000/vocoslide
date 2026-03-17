@@ -19,6 +19,16 @@ def format_srt_time(seconds):
     h = int(seconds // 3600)
     return f"{h:02}:{m:02}:{s:02},{ms:03}"
 
+def save_vtt(srt_content, vtt_path):
+    """SRTの内容をWebVTT形式に変換して保存"""
+    # 先頭に必須の文字列を追加
+    vtt_text = "WEBVTT\n\n" + srt_content
+    # ミリ秒の区切りをカンマからドットへ置換 (00:00:01,500 -> 00:00:01.500)
+    vtt_text = vtt_text.replace(',', '.')
+    
+    with open(vtt_path, "w", encoding="utf-8-sig") as f:
+        f.write(vtt_text)
+
 def main():
     if len(sys.argv) < 2:
         print("Usage: python 04_merge_video.py [BASE_NAME]")
@@ -132,7 +142,15 @@ def main():
             srt_lines.append(f"{srt_counter}\n{format_srt_time(total_elapsed_seconds)} --> {format_srt_time(total_elapsed_seconds + CREDIT_DURATION)}\n{credit_text}\n")
 
         # 3. 最終結合
-        with open(srt_path, "w", encoding="utf-8-sig") as f: f.write("\n".join(srt_lines))
+        # 3. 最終結合
+        srt_content = "\n".join(srt_lines)
+        with open(srt_path, "w", encoding="utf-8-sig") as f: 
+            f.write(srt_content)
+    
+        # VTTファイルの保存
+        vtt_path = srt_path.replace('.srt', '.vtt')
+        save_vtt(srt_content, vtt_path)
+
         subprocess.run([FFMPEG_PATH, "-y", "-f", "concat", "-safe", "0", "-i", concat_list_path.replace('\\', '/'), "-c", "copy", final_output], check=True)
         print(f"SUCCESS!\nVideo: {final_output}")
 

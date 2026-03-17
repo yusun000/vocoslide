@@ -21,12 +21,11 @@ def apply_dictionary(text, dictionary):
         text = text.replace(key, dictionary[key])
     return text
 
-def split_long_text(text, max_len=35):
+def split_long_text(text, max_len=20): # デフォルトを20程度に変更
     """
-    1. 元々ある '//' や '／／' を最優先の分割点とする
-    2. 分割された各区間が max_len を超える場合のみ、句読点ベースで自動分割する
+    1. 元々ある '//' を最優先の分割点とする
+    2. 分割された各区間が max_len を超える場合のみ、句読点を考慮して結合分割する
     """
-    # 元々の分割記号（半角/全角）で一度リスト化
     user_segments = re.split(r'//|／／', text)
     final_results = []
 
@@ -35,29 +34,30 @@ def split_long_text(text, max_len=35):
         if not segment:
             continue
 
-        # 手動分割された区間が制限文字数内の場合はそのまま採用
         if len(segment) <= max_len:
             final_results.append(segment)
         else:
-            # 制限を超えている場合のみ自動分割ロジックを適用
-            # 句読点（。、？！）や空白で分割を試みる
-            delimiters = r'([。、？！?!\s])'
-            chunks = re.split(delimiters, segment)
+            # 改善ロジック：句読点（。、？！）を直前の文字とセットにして抽出
+            # 例：「今日は、晴れですね。」 -> ['今日は、', '晴れですね。']
+            chunks = re.findall(r'[^。、？！?!\s]+[。、？！?!\s]*', segment)
             
             current_line = ""
             for chunk in chunks:
-                if not chunk: continue
-                # 次の塊を足すと制限を超える場合、現在の行を確定
-                if len(current_line) + len(chunk) > max_len and current_line:
-                    final_results.append(current_line.strip())
-                    current_line = chunk
-                else:
+                # この塊を足しても max_len 以内なら結合
+                if len(current_line) + len(chunk) <= max_len:
                     current_line += chunk
+                else:
+                    # 超える場合は、現在の行を確定（空でなければ）
+                    if current_line:
+                        final_results.append(current_line.strip())
+                    
+                    # 新しい塊がそもそも max_len より長い場合は強制分割が必要だが、
+                    # 基本は新しい行の開始とする
+                    current_line = chunk
             
             if current_line:
                 final_results.append(current_line.strip())
 
-    # 全てを全角 '／／' で繋ぎ直す
     return "／／".join(final_results)
 
 def main():
