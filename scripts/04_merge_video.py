@@ -1,7 +1,15 @@
-import os
+import argparse
 import json
+import os
+import shutil
 import subprocess
 import sys
+import time
+from pathlib import Path
+
+# scripts/ からの実行でもプロジェクトルート基準の相対パスを扱いやすくする
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+
 from PIL import Image, ImageDraw, ImageFont
 
 # キャラクターIDと表示名の対応表
@@ -12,152 +20,300 @@ SPEAKER_MAP = {
     8: "春日部つむぎ",
 }
 
+
+def load_config(config_path: str = "config.json"):
+    if not os.path.exists(config_path):
+        return {}
+    with open(config_path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="スライド画像と音声を結合して動画生成")
+    parser.add_argument("base_name", help="出力動画名のベース")
+    parser.add_argument("--timing-file", default="temp/timings.json")
+    parser.add_argument("--slide-dir", default="temp/slides")
+    parser.add_argument("--audio-dir", default="temp/audio")
+    parser.add_argument("--work-dir", default="temp/work")
+    parser.add_argument("--output-dir", default="output")
+    parser.add_argument("--ffmpeg-path", default=None)
+    parser.add_argument("--silence-duration", type=float, default=None)
+    parser.add_argument("--credit-duration", type=float, default=None)
+    parser.add_argument("--keep-work", action="store_true", help="work配下の中間ファイルを削除しない")
+    parser.add_argument("--quiet", action="store_true", help="進捗ログを抑制")
+    parser.add_argument("--stats-file", default="temp/merge_stats.json", help="処理統計の保存先")
+    return parser.parse_args()
+
+
+def log(message: str, quiet: bool = False):
+    if not quiet:
+        print(message)
+
+
 def format_srt_time(seconds):
-    ms = int((seconds % 1) * 1000)
+    ms = int(round((seconds % 1) * 1000))
+    if ms == 1000:
+        seconds += 1
+        ms = 0
     s = int(seconds % 60)
     m = int((seconds // 60) % 60)
     h = int(seconds // 3600)
     return f"{h:02}:{m:02}:{s:02},{ms:03}"
 
+
 def save_vtt(srt_content, vtt_path):
-    """SRTの内容をWebVTT形式に変換して保存"""
-    # 先頭に必須の文字列を追加
     vtt_text = "WEBVTT\n\n" + srt_content
-    # ミリ秒の区切りをカンマからドットへ置換 (00:00:01,500 -> 00:00:01.500)
     vtt_text = vtt_text.replace(',', '.')
-    
     with open(vtt_path, "w", encoding="utf-8-sig") as f:
         f.write(vtt_text)
 
-def main():
-    if len(sys.argv) < 2:
-        print("Usage: python 04_merge_video.py [BASE_NAME]")
-        sys.exit(1)
 
-    base_name = sys.argv[1]
-    FFMPEG_PATH = "ffmpeg"
-    SILENCE_DURATION = 0.8
-    
-    timing_file = "temp/timings.json"
-    slide_dir = os.path.abspath("temp/slides")
-    audio_dir = os.path.abspath("temp/audio")
-    work_dir = os.path.abspath("temp/work")
-    final_output = os.path.abspath(f"output/{base_name}.mp4")
-    srt_path = os.path.abspath(f"output/{base_name}.srt")
-    
+def run_ffmpeg(cmd, quiet=False, label="ffmpeg"):
+    started = time.perf_counter()
+    proc = subprocess.run(cmd, check=True, capture_output=True, text=True)
+    elapsed = time.perf_counter() - started
+    log(f"[{label}] {elapsed:.2f}s", quiet)
+    if not quiet and proc.stderr:
+        stderr = proc.stderr.strip()
+        if stderr:
+            tail = "\n".join(stderr.splitlines()[-5:])
+            if tail:
+                log(f"[{label}] ffmpeg tail:\n{tail}", quiet)
+    return elapsed
+
+
+def ensure_even_scale_filter():
+    return "scale=trunc(iw/2)*2:trunc(ih/2)*2,format=yuv420p"
+
+
+def build_credit_image(credit_text: str, output_path: str):
+    img = Image.new('RGB', (1920, 1080), color=(0, 0, 0))
+    draw = ImageDraw.Draw(img)
+    font_list = [
+        "msgothic.ttc", "MS Gothic",
+        "NotoSansCJK-Regular.ttc", "Noto Sans CJK JP",
+        "ipag.ttc", "IPAゴシック",
+        "DejaVuSans.ttf"
+    ]
+    font = None
+    for f_name in font_list:
+        try:
+            font = ImageFont.truetype(f_name, 60)
+            break
+        except Exception:
+            continue
+    if font is None:
+        font = ImageFont.load_default()
+
+    bbox = draw.textbbox((0, 0), credit_text, font=font)
+    x = (1920 - (bbox[2] - bbox[0])) / 2
+    y = (1080 - (bbox[3] - bbox[1])) / 2
+    draw.text((x, y), credit_text, fill=(255, 255, 255), font=font)
+    img.save(output_path)
+
+
+def cleanup_work_dir(work_dir: str, keep_work: bool, quiet: bool = False):
+    if keep_work:
+        log(f"workディレクトリを保持します: {work_dir}", quiet)
+        return
+    concat_list = Path(work_dir) / "concat_list.txt"
+    if concat_list.exists():
+        log(f"workディレクトリを保持しない設定ですが、デバッグしやすいよう中間ファイルは残します: {work_dir}", quiet)
+
+
+def main():
+    args = parse_args()
+    config = load_config()
+    video_cfg = config.get("video", {})
+    perf_cfg = config.get("performance", {})
+
+    base_name = args.base_name
+    ffmpeg_path = args.ffmpeg_path or video_cfg.get("ffmpeg_path", "ffmpeg")
+    silence_duration = args.silence_duration if args.silence_duration is not None else video_cfg.get("silence_duration", 0.8)
+    credit_duration = args.credit_duration if args.credit_duration is not None else video_cfg.get("credit_duration", 5.0)
+
+    timing_file = args.timing_file
+    slide_dir = os.path.abspath(args.slide_dir)
+    audio_dir = os.path.abspath(args.audio_dir)
+    work_dir = os.path.abspath(args.work_dir)
+    output_dir = os.path.abspath(args.output_dir)
+    final_output = os.path.abspath(os.path.join(output_dir, f"{base_name}.mp4"))
+    srt_path = os.path.abspath(os.path.join(output_dir, f"{base_name}.srt"))
+    vtt_path = srt_path.replace('.srt', '.vtt')
+    stats_file = os.path.abspath(args.stats_file)
+
     os.makedirs(work_dir, exist_ok=True)
-    os.makedirs("output", exist_ok=True)
+    os.makedirs(output_dir, exist_ok=True)
+    os.makedirs(os.path.dirname(stats_file), exist_ok=True)
+
+    if not os.path.exists(timing_file):
+        print(f"Error: timing file not found: {timing_file}")
+        sys.exit(1)
 
     with open(timing_file, "r", encoding="utf-8-sig") as f:
         all_timings = json.load(f)
 
     srt_lines = []
     srt_counter = 1
-    total_elapsed_seconds = 0.0 
+    total_elapsed_seconds = 0.0
     concat_list_path = os.path.join(work_dir, "concat_list.txt")
-    
-    print(f"--- Step04: Final Assembly Start ({base_name}) ---")
+    overall_started = time.perf_counter()
+    stats = {
+        "base_name": base_name,
+        "timing_file": timing_file,
+        "slide_count": 0,
+        "audio_part_count": 0,
+        "silence_duration": silence_duration,
+        "credit_duration": credit_duration,
+        "pages": [],
+        "timings": {},
+        "settings": {
+            "ffmpeg_path": ffmpeg_path,
+            "keep_work": args.keep_work,
+            "quiet": args.quiet,
+            "video_perf_config": perf_cfg,
+        },
+    }
+
+    log(f"--- Step04: Final Assembly Start ({base_name}) ---", args.quiet)
+    log(
+        f"設定: silence={silence_duration}s, credit={credit_duration}s, ffmpeg={ffmpeg_path}",
+        args.quiet,
+    )
 
     try:
         with open(concat_list_path, "w", encoding="utf-8") as f_list:
-            # 1. 本編スライドの処理 (既存ロジック)
             for page_num_str in sorted(all_timings.keys(), key=int):
+                page_started = time.perf_counter()
                 page_num = int(page_num_str)
                 parts = all_timings[page_num_str]
                 slide_img = os.path.join(slide_dir, f"slide_{page_num:03d}.png").replace('\\', '/')
                 temp_audio = os.path.join(work_dir, f"page_{page_num:03d}.wav").replace('\\', '/')
                 page_video = os.path.join(work_dir, f"page_{page_num:03d}.mp4").replace('\\', '/')
 
-                if not os.path.exists(slide_img): continue 
+                if not os.path.exists(slide_img):
+                    log(f"Warning: slide image not found, skip page {page_num}: {slide_img}", args.quiet)
+                    continue
 
                 audio_inputs = []
                 audio_filter = ""
                 current_page_duration = 0.0
+
                 for i, part in enumerate(parts):
-                    audio_inputs.append(os.path.join(audio_dir, part['file']).replace('\\', '/'))
-                    audio_filter += f"[{i}:a]adelay={int(SILENCE_DURATION*1000)}|{int(SILENCE_DURATION*1000)}[a{i}];"
-                    part_start = total_elapsed_seconds + current_page_duration + SILENCE_DURATION
+                    audio_file = os.path.join(audio_dir, part['file']).replace('\\', '/')
+                    if not os.path.exists(audio_file):
+                        raise FileNotFoundError(f"音声ファイルが見つかりません: {audio_file}")
+                    audio_inputs.append(audio_file)
+                    delay_ms = int(silence_duration * 1000)
+                    audio_filter += f"[{i}:a]adelay={delay_ms}|{delay_ms}[a{i}];"
+                    part_start = total_elapsed_seconds + current_page_duration + silence_duration
                     part_end = part_start + part['duration']
-                    srt_lines.append(f"{srt_counter}\n{format_srt_time(part_start)} --> {format_srt_time(part_end)}\n{part['text']}\n")
-                    current_page_duration += (SILENCE_DURATION + part['duration'])
+                    srt_lines.append(
+                        f"{srt_counter}\n{format_srt_time(part_start)} --> {format_srt_time(part_end)}\n{part['text']}\n"
+                    )
+                    current_page_duration += (silence_duration + part['duration'])
                     srt_counter += 1
+                    stats["audio_part_count"] += 1
+
+                if not audio_inputs:
+                    log(f"Warning: page {page_num} に音声パートがありません。スキップします。", args.quiet)
+                    continue
 
                 audio_filter += "".join([f"[a{i}]" for i in range(len(parts))]) + f"concat=n={len(parts)}:v=0:a=1[aout]"
-                cmd_audio = [FFMPEG_PATH, "-y"]
-                for a_in in audio_inputs: cmd_audio.extend(["-i", a_in])
+                cmd_audio = [ffmpeg_path, "-y"]
+                for a_in in audio_inputs:
+                    cmd_audio.extend(["-i", a_in])
                 cmd_audio.extend(["-filter_complex", audio_filter, "-map", "[aout]", temp_audio])
-                subprocess.run(cmd_audio, check=True, capture_output=True)
+                audio_elapsed = run_ffmpeg(cmd_audio, args.quiet, label=f"page{page_num:03d}-audio")
 
                 cmd_video = [
-                    FFMPEG_PATH, "-y", "-loop", "1", "-i", slide_img, "-i", temp_audio,
+                    ffmpeg_path, "-y", "-loop", "1", "-i", slide_img, "-i", temp_audio,
                     "-t", str(current_page_duration), "-c:v", "libx264", "-tune", "stillimage",
-                    "-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2,format=yuv420p", "-c:a", "aac", "-b:a", "192k",
+                    "-vf", ensure_even_scale_filter(), "-c:a", "aac", "-b:a", "192k",
                     page_video
                 ]
-                subprocess.run(cmd_video, check=True, capture_output=True)
+                video_elapsed = run_ffmpeg(cmd_video, args.quiet, label=f"page{page_num:03d}-video")
                 f_list.write(f"file '{page_video}'\n")
                 total_elapsed_seconds += current_page_duration
-                print(f"Processed Page {page_num}...")
+                page_elapsed = time.perf_counter() - page_started
+                stats["slide_count"] += 1
+                stats["pages"].append(
+                    {
+                        "page": page_num,
+                        "parts": len(parts),
+                        "duration": current_page_duration,
+                        "audio_elapsed": audio_elapsed,
+                        "video_elapsed": video_elapsed,
+                        "elapsed": page_elapsed,
+                        "page_video": page_video,
+                    }
+                )
+                log(
+                    f"Processed Page {page_num}: parts={len(parts)}, video_duration={current_page_duration:.2f}s, elapsed={page_elapsed:.2f}s",
+                    args.quiet,
+                )
 
-            # 2. クレジットページの動的生成
-            CREDIT_DURATION = 5.0
             actual_credit_img = os.path.join(work_dir, "generated_credit.png")
-            
-            used_ids = {p.get("speaker_id") for page in all_timings.values() for p in page}
+            used_ids = sorted({p.get("speaker_id") for page in all_timings.values() for p in page if p.get("speaker_id") is not None})
             names = [SPEAKER_MAP.get(sid, f"Unknown({sid})") for sid in used_ids]
-            credit_text = f"読み上げ：VOICEVOX {'、'.join(names)}"
+            credit_text = f"読み上げ：VOICEVOX {'、'.join(names)}" if names else "読み上げ：VOICEVOX"
 
-            if os.path.exists("assets/credit.png"):
-                actual_credit_img = os.path.abspath("assets/credit.png")
+            asset_credit = PROJECT_ROOT / "assets" / "credit.png"
+            if asset_credit.exists():
+                actual_credit_img = str(asset_credit.resolve())
             else:
-                # 画像自動生成 (Linux/Windows両対応フォント探索)
-                img = Image.new('RGB', (1920, 1080), color=(0, 0, 0))
-                draw = ImageDraw.Draw(img)
-                font_list = [
-                    "msgothic.ttc", "MS Gothic",               # Windows
-                    "NotoSansCJK-Regular.ttc", "Noto Sans CJK JP", # Linux (Ubuntu等)
-                    "ipag.ttc", "IPAゴシック",                  # Linux
-                    "DejaVuSans.ttf"                          # Fallback
-                ]
-                font = None
-                for f_name in font_list:
-                    try:
-                        font = ImageFont.truetype(f_name, 60)
-                        break
-                    except: continue
-                if font is None: font = ImageFont.load_default()
-                
-                bbox = draw.textbbox((0, 0), credit_text, font=font)
-                draw.text(((1920-(bbox[2]-bbox[0]))/2, (1080-(bbox[3]-bbox[1]))/2), credit_text, fill=(255, 255, 255), font=font)
-                img.save(actual_credit_img)
+                build_credit_image(credit_text, actual_credit_img)
 
             credit_video = os.path.join(work_dir, "credit_page.mp4").replace('\\', '/')
-            subprocess.run([
-                FFMPEG_PATH, "-y", "-loop", "1", "-i", actual_credit_img,
-                "-f", "lavfi", "-i", "anullsrc=r=44100:cl=stereo", "-t", str(CREDIT_DURATION),
+            credit_elapsed = run_ffmpeg([
+                ffmpeg_path, "-y", "-loop", "1", "-i", actual_credit_img,
+                "-f", "lavfi", "-i", "anullsrc=r=44100:cl=stereo", "-t", str(credit_duration),
                 "-c:v", "libx264", "-vf", "scale=1920:1080,format=yuv420p", "-c:a", "aac", credit_video
-            ], check=True, capture_output=True)
-            
-            f_list.write(f"file '{credit_video}'\n")
-            srt_lines.append(f"{srt_counter}\n{format_srt_time(total_elapsed_seconds)} --> {format_srt_time(total_elapsed_seconds + CREDIT_DURATION)}\n{credit_text}\n")
+            ], args.quiet, label="credit-video")
 
-        # 3. 最終結合
-        # 3. 最終結合
+            f_list.write(f"file '{credit_video}'\n")
+            srt_lines.append(
+                f"{srt_counter}\n{format_srt_time(total_elapsed_seconds)} --> {format_srt_time(total_elapsed_seconds + credit_duration)}\n{credit_text}\n"
+            )
+            stats["timings"]["credit_elapsed"] = credit_elapsed
+
         srt_content = "\n".join(srt_lines)
-        with open(srt_path, "w", encoding="utf-8-sig") as f: 
+        with open(srt_path, "w", encoding="utf-8-sig") as f:
             f.write(srt_content)
-    
-        # VTTファイルの保存
-        vtt_path = srt_path.replace('.srt', '.vtt')
         save_vtt(srt_content, vtt_path)
 
-        subprocess.run([FFMPEG_PATH, "-y", "-f", "concat", "-safe", "0", "-i", concat_list_path.replace('\\', '/'), "-c", "copy", final_output], check=True)
-        print(f"SUCCESS!\nVideo: {final_output}")
+        final_concat_elapsed = run_ffmpeg(
+            [ffmpeg_path, "-y", "-f", "concat", "-safe", "0", "-i", concat_list_path.replace('\\', '/'), "-c", "copy", final_output],
+            args.quiet,
+            label="final-concat",
+        )
+
+        overall_elapsed = time.perf_counter() - overall_started
+        stats["timings"].update(
+            {
+                "final_concat_elapsed": final_concat_elapsed,
+                "overall_elapsed": overall_elapsed,
+                "output_video_duration_estimated": total_elapsed_seconds + credit_duration,
+            }
+        )
+        with open(stats_file, "w", encoding="utf-8-sig") as f:
+            json.dump(stats, f, indent=2, ensure_ascii=False)
+
+        log(f"SUCCESS!\nVideo: {final_output}", args.quiet)
+        log(f"Subtitle: {srt_path}", args.quiet)
+        log(f"VTT: {vtt_path}", args.quiet)
+        log(
+            f"統計: slides={stats['slide_count']}, audio_parts={stats['audio_part_count']}, total_elapsed={overall_elapsed:.2f}s, estimated_video={total_elapsed_seconds + credit_duration:.2f}s",
+            args.quiet,
+        )
+        log(f"merge統計JSON: {stats_file}", args.quiet)
+
+        cleanup_work_dir(work_dir, args.keep_work, args.quiet)
 
     except Exception as e:
         print(f"Error: {e}")
         sys.exit(1)
 
+
 if __name__ == "__main__":
     main()
-
