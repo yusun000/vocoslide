@@ -27,7 +27,7 @@ def check_environment():
             with open(CONFIG_FILE, "r", encoding="utf-8") as f:
                 port = json.load(f).get("voicevox", {}).get("port", 50021)
         
-        res = requests.get(f"http://127.0.0.1:{port}/speakers", timeout=3)
+        res = requests.get(f"http://127.0.0.1:{port}/speakers", timeout=3, proxies={"http": None, "https": None})
         if res.status_code != 200:
             raise Exception
     except:

@@ -16,6 +16,8 @@ class VoicevoxGenerator:
         )
         query_res.raise_for_status()
         query = query_res.json()
+        # サンプリングレートの指定
+        query['outputSamplingRate'] = 44100
 
         # 音声合成の実行
         synth_res = requests.post(

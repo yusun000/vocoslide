@@ -96,11 +96,11 @@ def main():
                 clean_text = raw_text.strip().replace('\n', ' ')
                 
                 # 1. 辞書適用（読み上げ用）
-                reading_base = apply_dictionary(clean_text, dictionary)
+                # reading_base = apply_dictionary(clean_text, dictionary)
                 
                 # 2. 手動分割優先 ＋ 自動分割
                 final_subtitle = split_long_text(clean_text, max_len=MAX_CHARS_PER_LINE)
-                final_reading = split_long_text(reading_base, max_len=MAX_CHARS_PER_LINE)
+                final_reading = apply_dictionary(final_subtitle, dictionary)
                 
                 formatted_notes.append({
                     "slide_number": page_num,
