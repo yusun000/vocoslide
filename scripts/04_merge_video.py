@@ -20,6 +20,11 @@ SPEAKER_MAP = {
     8: "春日部つむぎ",
 }
 
+DEFAULT_FPS = 30
+DEFAULT_AUDIO_RATE = 48000
+DEFAULT_AUDIO_CHANNELS = 2
+DEFAULT_AUDIO_BITRATE = "192k"
+
 
 def load_config(config_path: str = "config.json"):
     if not os.path.exists(config_path):
@@ -84,10 +89,6 @@ def run_ffmpeg(cmd, quiet=False, label="ffmpeg"):
     return elapsed
 
 
-def ensure_even_scale_filter():
-    return "scale=trunc(iw/2)*2:trunc(ih/2)*2,format=yuv420p"
-
-
 def quote_concat_path(path: str) -> str:
     return str(path).replace('\\', '/').replace("'", "'\\''")
 
@@ -112,31 +113,158 @@ def get_media_duration(media_path: str, ffprobe_path: str) -> float:
     return float(proc.stdout.strip())
 
 
+def has_audio_stream(media_path: str, ffprobe_path: str) -> bool:
+    cmd = [
+        ffprobe_path,
+        "-v", "error",
+        "-select_streams", "a:0",
+        "-show_entries", "stream=index",
+        "-of", "csv=p=0",
+        media_path,
+    ]
+    proc = subprocess.run(cmd, check=True, capture_output=True, text=True)
+    return bool(proc.stdout.strip())
+
+
 def get_image_size(image_path: str):
     with Image.open(image_path) as img:
         return img.size
 
 
-def normalize_insert_video(input_path: str, output_path: str, ffmpeg_path: str, width: int, height: int, fps: int, quiet: bool):
-    """外部動画・埋め込み動画をスライド動画と連結しやすいMP4へ変換する。"""
-    vf = (
+def fit_video_filter(width: int, height: int, fps: int) -> str:
+    return (
+        "setpts=PTS-STARTPTS,"
         f"scale={width}:{height}:force_original_aspect_ratio=decrease,"
         f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,"
         f"fps={fps},format=yuv420p"
     )
-    cmd = [
+
+
+def still_image_filter(width: int, height: int, fps: int) -> str:
+    return (
+        f"scale={width}:{height}:force_original_aspect_ratio=decrease,"
+        f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,"
+        f"fps={fps},format=yuv420p"
+    )
+
+
+def normalize_insert_video(
+    input_path: str,
+    output_path: str,
+    ffmpeg_path: str,
+    ffprobe_path: str,
+    width: int,
+    height: int,
+    fps: int,
+    audio_rate: int,
+    audio_channels: int,
+    quiet: bool,
+):
+    """
+    外部動画・埋め込み動画を、ページ動画と同じ仕様のMP4へ変換する。
+
+    重要:
+    - PTSを0始まりにリセットする
+    - fps、解像度、pix_fmt、音声サンプルレート、チャンネル数を統一する
+    - 音声なし動画にも無音トラックを付ける
+    これをしないと concat 時にコマ送り、音声食い込み、表示時間ずれが起きやすい。
+    """
+    video_filter = fit_video_filter(width, height, fps)
+    input_duration = get_media_duration(input_path, ffprobe_path)
+
+    if has_audio_stream(input_path, ffprobe_path):
+        filter_complex = (
+            f"[0:v]{video_filter}[v];"
+            f"[0:a]asetpts=PTS-STARTPTS,"
+            f"aformat=sample_rates={audio_rate}:channel_layouts=stereo,apad[a]"
+        )
+        cmd = [
+            ffmpeg_path, "-y",
+            "-i", input_path,
+            "-filter_complex", filter_complex,
+            "-map", "[v]",
+            "-map", "[a]",
+            "-t", f"{input_duration:.6f}",
+            "-c:v", "libx264",
+            "-r", str(fps),
+            "-pix_fmt", "yuv420p",
+            "-c:a", "aac",
+            "-ar", str(audio_rate),
+            "-ac", str(audio_channels),
+            "-b:a", DEFAULT_AUDIO_BITRATE,
+            "-movflags", "+faststart",
+            output_path,
+        ]
+    else:
+        cmd = [
+            ffmpeg_path, "-y",
+            "-i", input_path,
+            "-f", "lavfi",
+            "-t", f"{input_duration:.6f}",
+            "-i", f"anullsrc=r={audio_rate}:cl=stereo",
+            "-filter_complex", f"[0:v]{video_filter}[v]",
+            "-map", "[v]",
+            "-map", "1:a",
+            "-t", f"{input_duration:.6f}",
+            "-c:v", "libx264",
+            "-r", str(fps),
+            "-pix_fmt", "yuv420p",
+            "-c:a", "aac",
+            "-ar", str(audio_rate),
+            "-ac", str(audio_channels),
+            "-b:a", DEFAULT_AUDIO_BITRATE,
+            "-movflags", "+faststart",
+            output_path,
+        ]
+
+    return run_ffmpeg(cmd, quiet, label=f"insert-video-{Path(output_path).stem}")
+
+
+def make_page_audio(audio_inputs, parts_count: int, output_path: str, ffmpeg_path: str, silence_duration: float, audio_rate: int, audio_channels: int, quiet: bool, label: str):
+    """複数の読み上げ音声を、各パート前の無音を含めて1本のWAVへまとめる。"""
+    audio_filter = ""
+    delay_ms = int(silence_duration * 1000)
+    for i in range(parts_count):
+        audio_filter += (
+            f"[{i}:a]adelay={delay_ms}|{delay_ms},"
+            f"aformat=sample_rates={audio_rate}:channel_layouts=stereo[a{i}];"
+        )
+    audio_filter += "".join([f"[a{i}]" for i in range(parts_count)]) + f"concat=n={parts_count}:v=0:a=1[aout]"
+
+    cmd_audio = [ffmpeg_path, "-y"]
+    for a_in in audio_inputs:
+        cmd_audio.extend(["-i", a_in])
+    cmd_audio.extend([
+        "-filter_complex", audio_filter,
+        "-map", "[aout]",
+        "-ar", str(audio_rate),
+        "-ac", str(audio_channels),
+        output_path,
+    ])
+    return run_ffmpeg(cmd_audio, quiet, label=label)
+
+
+def make_page_video(slide_img: str, audio_path: str, output_path: str, ffmpeg_path: str, duration: float, width: int, height: int, fps: int, audio_rate: int, audio_channels: int, quiet: bool, label: str):
+    """スライド静止画と読み上げ音声から、挿入動画と同一仕様のページ動画を作る。"""
+    cmd_video = [
         ffmpeg_path, "-y",
-        "-i", input_path,
-        "-vf", vf,
+        "-loop", "1",
+        "-framerate", str(fps),
+        "-i", slide_img,
+        "-i", audio_path,
+        "-t", f"{duration:.6f}",
+        "-vf", still_image_filter(width, height, fps),
         "-c:v", "libx264",
+        "-r", str(fps),
         "-pix_fmt", "yuv420p",
         "-c:a", "aac",
-        "-ar", "48000",
-        "-ac", "2",
-        "-b:a", "192k",
+        "-ar", str(audio_rate),
+        "-ac", str(audio_channels),
+        "-b:a", DEFAULT_AUDIO_BITRATE,
+        "-movflags", "+faststart",
         output_path,
     ]
-    return run_ffmpeg(cmd, quiet, label=f"insert-video-{Path(output_path).stem}")
+    return run_ffmpeg(cmd_video, quiet, label=label)
 
 
 def load_notes_video_plan(notes_file: str):
@@ -176,6 +304,8 @@ def append_insert_videos(
     width: int,
     height: int,
     fps: int,
+    audio_rate: int,
+    audio_channels: int,
     current_total_seconds: float,
     stats: dict,
     quiet: bool,
@@ -198,7 +328,10 @@ def append_insert_videos(
             continue
 
         out_path = os.path.join(work_dir, f"page_{page_num:03d}_{slot}_{idx:02d}.mp4").replace('\\', '/')
-        elapsed = normalize_insert_video(src.replace('\\', '/'), out_path, ffmpeg_path, width, height, fps, quiet)
+        elapsed = normalize_insert_video(
+            src.replace('\\', '/'), out_path, ffmpeg_path, ffprobe_path,
+            width, height, fps, audio_rate, audio_channels, quiet,
+        )
         duration = get_media_duration(out_path, ffprobe_path)
         f_list.write(f"file '{quote_concat_path(out_path)}'\n")
         added_duration += duration
@@ -248,6 +381,59 @@ def build_credit_image(credit_text: str, output_path: str, size=(1920, 1080)):
     img.save(output_path)
 
 
+def make_credit_video(credit_img: str, output_path: str, ffmpeg_path: str, duration: float, width: int, height: int, fps: int, audio_rate: int, audio_channels: int, quiet: bool):
+    cmd = [
+        ffmpeg_path, "-y",
+        "-loop", "1",
+        "-framerate", str(fps),
+        "-i", credit_img,
+        "-f", "lavfi",
+        "-i", f"anullsrc=r={audio_rate}:cl=stereo",
+        "-t", f"{duration:.6f}",
+        "-vf", still_image_filter(width, height, fps),
+        "-c:v", "libx264",
+        "-r", str(fps),
+        "-pix_fmt", "yuv420p",
+        "-c:a", "aac",
+        "-ar", str(audio_rate),
+        "-ac", str(audio_channels),
+        "-b:a", DEFAULT_AUDIO_BITRATE,
+        "-movflags", "+faststart",
+        output_path,
+    ]
+    return run_ffmpeg(cmd, quiet, label="credit-video")
+
+
+def final_concat(concat_list_path: str, final_output: str, ffmpeg_path: str, fps: int, audio_rate: int, audio_channels: int, quiet: bool, copy_mode: bool):
+    """最終連結。既定は再エンコードで、タイムスタンプと音声食い込みを安定させる。"""
+    if copy_mode:
+        cmd = [
+            ffmpeg_path, "-y",
+            "-f", "concat",
+            "-safe", "0",
+            "-i", concat_list_path.replace('\\', '/'),
+            "-c", "copy",
+            final_output,
+        ]
+    else:
+        cmd = [
+            ffmpeg_path, "-y",
+            "-f", "concat",
+            "-safe", "0",
+            "-i", concat_list_path.replace('\\', '/'),
+            "-c:v", "libx264",
+            "-r", str(fps),
+            "-pix_fmt", "yuv420p",
+            "-c:a", "aac",
+            "-ar", str(audio_rate),
+            "-ac", str(audio_channels),
+            "-b:a", DEFAULT_AUDIO_BITRATE,
+            "-movflags", "+faststart",
+            final_output,
+        ]
+    return run_ffmpeg(cmd, quiet, label="final-concat")
+
+
 def cleanup_work_dir(work_dir: str, keep_work: bool, quiet: bool = False):
     if keep_work:
         log(f"workディレクトリを保持します: {work_dir}", quiet)
@@ -270,8 +456,11 @@ def main():
     silence_duration = args.silence_duration if args.silence_duration is not None else video_cfg.get("silence_duration", 0.8)
     credit_duration = args.credit_duration if args.credit_duration is not None else video_cfg.get("credit_duration", 5.0)
     insert_enabled = insert_cfg.get("enabled", True)
-    insert_fps = int(insert_cfg.get("fps", video_cfg.get("fps", 30)))
+    output_fps = int(insert_cfg.get("fps", video_cfg.get("fps", DEFAULT_FPS)))
+    audio_rate = int(video_cfg.get("audio_rate", DEFAULT_AUDIO_RATE))
+    audio_channels = int(video_cfg.get("audio_channels", DEFAULT_AUDIO_CHANNELS))
     missing_policy = insert_cfg.get("missing_file", "warn")
+    final_copy_mode = bool(video_cfg.get("final_concat_copy", False))
 
     timing_file = args.timing_file
     notes_file = args.notes_file
@@ -317,6 +506,10 @@ def main():
         "settings": {
             "ffmpeg_path": ffmpeg_path,
             "ffprobe_path": ffprobe_path,
+            "fps": output_fps,
+            "audio_rate": audio_rate,
+            "audio_channels": audio_channels,
+            "final_concat_copy": final_copy_mode,
             "keep_work": args.keep_work,
             "quiet": args.quiet,
             "video_perf_config": perf_cfg,
@@ -326,7 +519,7 @@ def main():
 
     log(f"--- Step04: Final Assembly Start ({base_name}) ---", args.quiet)
     log(
-        f"設定: silence={silence_duration}s, credit={credit_duration}s, ffmpeg={ffmpeg_path}, video_insert={insert_enabled}",
+        f"設定: silence={silence_duration}s, credit={credit_duration}s, fps={output_fps}, audio={audio_rate}Hz/{audio_channels}ch, final_copy={final_copy_mode}",
         args.quiet,
     )
 
@@ -357,12 +550,12 @@ def main():
 
                 before_duration = append_insert_videos(
                     f_list, before_items, page_num, "before", work_dir, ffmpeg_path, ffprobe_path,
-                    slide_width, slide_height, insert_fps, total_elapsed_seconds, stats, args.quiet, missing_policy,
+                    slide_width, slide_height, output_fps, audio_rate, audio_channels,
+                    total_elapsed_seconds, stats, args.quiet, missing_policy,
                 )
                 total_elapsed_seconds += before_duration
 
                 audio_inputs = []
-                audio_filter = ""
                 current_page_duration = 0.0
 
                 for i, part in enumerate(parts):
@@ -370,8 +563,6 @@ def main():
                     if not os.path.exists(audio_file):
                         raise FileNotFoundError(f"音声ファイルが見つかりません: {audio_file}")
                     audio_inputs.append(audio_file)
-                    delay_ms = int(silence_duration * 1000)
-                    audio_filter += f"[{i}:a]adelay={delay_ms}|{delay_ms}[a{i}];"
                     part_start = total_elapsed_seconds + current_page_duration + silence_duration
                     part_end = part_start + part['duration']
                     srt_lines.append(
@@ -382,29 +573,34 @@ def main():
                     stats["audio_part_count"] += 1
 
                 if not audio_inputs:
-                    log(f"Warning: page {page_num} に音声パートがありません。スキップします。", args.quiet)
+                    log(f"Warning: page {page_num} に音声パートがありません。スライド動画は作らず、after動画のみ処理します。", args.quiet)
+                    after_duration = append_insert_videos(
+                        f_list, after_items, page_num, "after", work_dir, ffmpeg_path, ffprobe_path,
+                        slide_width, slide_height, output_fps, audio_rate, audio_channels,
+                        total_elapsed_seconds, stats, args.quiet, missing_policy,
+                    )
+                    total_elapsed_seconds += after_duration
                     continue
 
-                audio_filter += "".join([f"[a{i}]" for i in range(len(parts))]) + f"concat=n={len(parts)}:v=0:a=1[aout]"
-                cmd_audio = [ffmpeg_path, "-y"]
-                for a_in in audio_inputs:
-                    cmd_audio.extend(["-i", a_in])
-                cmd_audio.extend(["-filter_complex", audio_filter, "-map", "[aout]", temp_audio])
-                audio_elapsed = run_ffmpeg(cmd_audio, args.quiet, label=f"page{page_num:03d}-audio")
+                audio_elapsed = make_page_audio(
+                    audio_inputs, len(parts), temp_audio, ffmpeg_path,
+                    silence_duration, audio_rate, audio_channels, args.quiet,
+                    label=f"page{page_num:03d}-audio",
+                )
 
-                cmd_video = [
-                    ffmpeg_path, "-y", "-loop", "1", "-i", slide_img, "-i", temp_audio,
-                    "-t", str(current_page_duration), "-c:v", "libx264", "-tune", "stillimage",
-                    "-vf", ensure_even_scale_filter(), "-c:a", "aac", "-b:a", "192k",
-                    page_video
-                ]
-                video_elapsed = run_ffmpeg(cmd_video, args.quiet, label=f"page{page_num:03d}-video")
+                video_elapsed = make_page_video(
+                    slide_img, temp_audio, page_video, ffmpeg_path, current_page_duration,
+                    slide_width, slide_height, output_fps, audio_rate, audio_channels,
+                    args.quiet, label=f"page{page_num:03d}-video",
+                )
+                actual_page_duration = get_media_duration(page_video, ffprobe_path)
                 f_list.write(f"file '{quote_concat_path(page_video)}'\n")
-                total_elapsed_seconds += current_page_duration
+                total_elapsed_seconds += actual_page_duration
 
                 after_duration = append_insert_videos(
                     f_list, after_items, page_num, "after", work_dir, ffmpeg_path, ffprobe_path,
-                    slide_width, slide_height, insert_fps, total_elapsed_seconds, stats, args.quiet, missing_policy,
+                    slide_width, slide_height, output_fps, audio_rate, audio_channels,
+                    total_elapsed_seconds, stats, args.quiet, missing_policy,
                 )
                 total_elapsed_seconds += after_duration
 
@@ -414,7 +610,8 @@ def main():
                     {
                         "page": page_num,
                         "parts": len(parts),
-                        "duration": current_page_duration,
+                        "planned_duration": current_page_duration,
+                        "actual_page_duration": actual_page_duration,
                         "insert_before_duration": before_duration,
                         "insert_after_duration": after_duration,
                         "audio_elapsed": audio_elapsed,
@@ -424,7 +621,7 @@ def main():
                     }
                 )
                 log(
-                    f"Processed Page {page_num}: parts={len(parts)}, slide_duration={current_page_duration:.2f}s, insert={before_duration + after_duration:.2f}s, elapsed={page_elapsed:.2f}s",
+                    f"Processed Page {page_num}: parts={len(parts)}, slide_duration={actual_page_duration:.2f}s, insert={before_duration + after_duration:.2f}s, elapsed={page_elapsed:.2f}s",
                     args.quiet,
                 )
 
@@ -445,12 +642,10 @@ def main():
                 build_credit_image(credit_text, actual_credit_img, target_size)
 
             credit_video = os.path.join(work_dir, "credit_page.mp4").replace('\\', '/')
-            credit_vf = f"scale={target_size[0]}:{target_size[1]},format=yuv420p"
-            credit_elapsed = run_ffmpeg([
-                ffmpeg_path, "-y", "-loop", "1", "-i", actual_credit_img,
-                "-f", "lavfi", "-i", "anullsrc=r=48000:cl=stereo", "-t", str(credit_duration),
-                "-c:v", "libx264", "-vf", credit_vf, "-c:a", "aac", "-ar", "48000", "-ac", "2", credit_video
-            ], args.quiet, label="credit-video")
+            credit_elapsed = make_credit_video(
+                actual_credit_img, credit_video, ffmpeg_path, credit_duration,
+                target_size[0], target_size[1], output_fps, audio_rate, audio_channels, args.quiet,
+            )
 
             f_list.write(f"file '{quote_concat_path(credit_video)}'\n")
             srt_lines.append(
@@ -463,10 +658,8 @@ def main():
             f.write(srt_content)
         save_vtt(srt_content, vtt_path)
 
-        final_concat_elapsed = run_ffmpeg(
-            [ffmpeg_path, "-y", "-f", "concat", "-safe", "0", "-i", concat_list_path.replace('\\', '/'), "-c", "copy", final_output],
-            args.quiet,
-            label="final-concat",
+        final_concat_elapsed = final_concat(
+            concat_list_path, final_output, ffmpeg_path, output_fps, audio_rate, audio_channels, args.quiet, final_copy_mode,
         )
 
         overall_elapsed = time.perf_counter() - overall_started
