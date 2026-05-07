@@ -134,7 +134,12 @@ def resolve_pptx_target(base_rels_path: str, target: str) -> str:
 
 
 def extract_embedded_videos_from_pptx(pptx_path: str, output_dir: str):
-    """PPTXに埋め込まれた動画をスライド番号ごとに抽出する。"""
+    """PPTXに埋め込まれた動画をスライド番号ごとに抽出する。
+
+    PowerPointのPPTXでは、同じ動画実体に対して media / video など複数の
+    Relationship が作られることがある。そのため、同一スライド内では
+    PPTX内部パス（ppt/media/mediaX.mp4 等）単位で重複排除する。
+    """
     output = Path(output_dir)
     output.mkdir(parents=True, exist_ok=True)
     videos_by_slide = {}
@@ -154,6 +159,7 @@ def extract_embedded_videos_from_pptx(pptx_path: str, output_dir: str):
             slide_no = int(Path(rel_path).name.replace("slide", "").replace(".xml.rels", ""))
             root = ET.fromstring(z.read(rel_path))
             video_index = 0
+            seen_internal_paths = set()
 
             for rel in root.findall("rel:Relationship", ns):
                 target = unquote(rel.attrib.get("Target", ""))
@@ -169,6 +175,11 @@ def extract_embedded_videos_from_pptx(pptx_path: str, output_dir: str):
                 if internal_path not in names:
                     print(f"[WARN] slide {slide_no}: 埋め込み動画の実体が見つかりません: {target}")
                     continue
+
+                if internal_path in seen_internal_paths:
+                    print(f"[SKIP] slide {slide_no}: 重複した埋め込み動画参照をスキップしました: {internal_path}")
+                    continue
+                seen_internal_paths.add(internal_path)
 
                 video_index += 1
                 out_name = f"slide_{slide_no:03d}_embedded_{video_index:02d}{ext}"
