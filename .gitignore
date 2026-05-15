@@ -17,6 +17,10 @@ temp/*
 !temp/.gitkeep
 output/*
 !output/.gitkeep
+test/*
+!test/.gitkeep
+dict_check/*
+!dict_check/.gitkeep
 
 # OS
 .DS_Store
