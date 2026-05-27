@@ -41,6 +41,8 @@ PDFから高品質なスライド画像を生成し、それらを統合して�
 │   └── custom_dict.json    # 読み上げ補正用ユーザー辞書
 ├── tools/
 │   └── voco-dict.py        # 字幕ファイルから読み上げ辞書候補を作成する補助ツール
+│   └── build_dict_voice_check_vocoslide.py
+│                           # カスタム辞書JSONの読み上げ確認HTMLを生成する補助ツール
 ├── input/                  # 【配置】変換元のPPTXとPDFを置く場所
 ├── temp/                   # 【自動生成】中間ファイル（実行のたびに削除）
 │   ├── embedded_videos/    # 【自動生成】PPTX内の埋め込み動画の抽出先
@@ -598,7 +600,8 @@ Copyright (c) 2026 yusun000
 ## 12. 付録：補助ツール
 
 以下は、VocoSlide本体の動画生成処理とは別に利用できる補助ツールです。  
-字幕ファイルから読み上げ辞書候補を作成したい場合に使用します。
+- 字幕ファイルから読み上げ辞書候補を作成する `voco-dict`
+- 作成したカスタム辞書の読み上げをブラウザで確認する `dict_voice_check`
 
 ### 12.1 voco-dict（字幕から読み辞書を作る）
 
@@ -674,3 +677,34 @@ python tools/voco-dict.py ./data/subs --mode voicevox --fallback blank -o readin
 - 最初は `--min-count 2` や `--top 200` などで絞って、辞書を小さく始めるのがおすすめです。
 - “正しい行”を大量に残すかどうかは運用次第ですが、修正した語だけを別ファイルに集約しておくと保守が楽です。  
   例：`reading_map.fixed.json`
+
+### 12.2 dict_voice_check（カスタム辞書の読み上げ確認）
+
+`tools/build_dict_voice_check_vocoslide.py` は、`dict/custom_dict.json` などの VocoSlide 用カスタム辞書JSONを読み込み、VOICEVOX ENGINE で確認用音声を生成し、ブラウザで確認できる静的HTMLページを作成する補助ツールです。
+
+辞書の登録語が増えてきた場合に、登録語ごとの読み上げをまとめて確認し、OK / NG / 保留、メモを記録する用途を想定しています。
+
+対象とするJSON形式は、VocoSlide本体と同じ「単語 → 読み」の単純な形式です。
+
+```json
+{
+  "AI": "エーアイ",
+  "MVP": "エムブイピー",
+  "重複": "ちょうふく"
+}
+```
+
+基本的な実行例：
+
+```bash
+python tools/build_dict_voice_check_vocoslide.py --input dict/custom_dict.json --out dict_check --speaker 3
+```
+
+最初は件数を絞って試すこともできます。
+
+```bash
+python tools/build_dict_voice_check_vocoslide.py --input dict/custom_dict.json --out dict_check_test --speaker 3 --limit 100
+```
+
+詳細な使い方は [README_dict_voice_check.md](./README_dict_voice_check.md) を参照してください。
+
