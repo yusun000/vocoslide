@@ -128,7 +128,10 @@ def main():
 
         cleanup_temp(keep_temp=args.keep_temp)
 
-        step03_args = []
+        step03_args = [
+            "--kana-check-file", os.path.join(OUTPUT_DIR, f"voicevox_kana_check_{base_name}.txt"),
+            "--kana-check-csv", os.path.join(OUTPUT_DIR, f"voicevox_kana_check_{base_name}.csv"),
+        ]
         if max_workers:
             step03_args += ["--max-workers", str(max_workers)]
         if args.no_disk_cache:

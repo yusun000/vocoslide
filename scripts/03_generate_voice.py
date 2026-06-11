@@ -3,6 +3,7 @@ import json
 import os
 import re
 import sys
+import csv
 from pathlib import Path
 
 # scripts/ からの実行でも utils/ を読めるようにする
@@ -43,6 +44,8 @@ def parse_args():
     parser.add_argument("--no-dedup", action="store_true")
     parser.add_argument("--clear-cache", action="store_true")
     parser.add_argument("--quiet", action="store_true")
+    parser.add_argument("--kana-check-file", default="temp/voicevox_kana_check.txt")
+    parser.add_argument("--kana-check-csv", default="temp/voicevox_kana_check.csv")
     return parser.parse_args()
 
 
@@ -63,6 +66,11 @@ def main():
 
     os.makedirs(audio_dir, exist_ok=True)
     Path(args.cache_dir).mkdir(parents=True, exist_ok=True)
+    Path(args.kana_check_file).parent.mkdir(parents=True, exist_ok=True)
+    Path(args.kana_check_csv).parent.mkdir(parents=True, exist_ok=True)
+
+    kana_check_lines = []
+    kana_check_rows = []
 
     if not os.path.exists(notes_json):
         print(f"Error: {notes_json} が見つかりません。Step01を先に実行してください。")
@@ -135,6 +143,35 @@ def main():
                         "synthesized": result["synthesized"],
                     }
                 )
+                voice_text = segments[i].text
+                kana = result.get("kana", "")
+
+                kana_check_lines.extend([
+                    f"--- PAGE_{page_num:03d} / PART_{i:02d} ---",
+                    "",
+                    "字幕:",
+                    part_subtitle,
+                    "",
+                    "VOICEVOX入力:",
+                    voice_text,
+                    "",
+                    "VOICEVOXカナ:",
+                    kana,
+                    "",
+                ])
+
+                kana_check_rows.append({
+                    "slide": page_num,
+                    "part": i,
+                    "subtitle": part_subtitle,
+                    "voice_text": voice_text,
+                    "voicevox_kana": kana,
+                    "audio_file": os.path.basename(result["path"]),
+                    "duration": result["duration"],
+                    "speaker_id": default_speaker_id,
+                    "cache_hit": result["cache_hit"],
+                    "synthesized": result["synthesized"],
+                })
 
             all_timings[page_num] = page_timings
 
@@ -145,8 +182,22 @@ def main():
         with open(timing_file, "w", encoding="utf-8-sig") as f:
             json.dump(all_timings, f, indent=4, ensure_ascii=False)
 
+        with open(args.kana_check_file, "w", encoding="utf-8-sig", newline="") as f:
+            f.write("\n".join(kana_check_lines))
+
+        with open(args.kana_check_csv, "w", encoding="utf-8-sig", newline="") as f:
+            fieldnames = [
+                "slide", "part", "subtitle", "voice_text", "voicevox_kana",
+                "audio_file", "duration", "speaker_id", "cache_hit", "synthesized"
+            ]
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerows(kana_check_rows)
+
         print(f"成功: 音声ファイルを {audio_dir} に保存しました。")
         print(f"タイミング情報を {timing_file} に保存しました。")
+        print(f"VOICEVOX読みカナ確認TXTを {args.kana_check_file} に保存しました。")
+        print(f"VOICEVOX読みカナ確認CSVを {args.kana_check_csv} に保存しました。")
         print(
             "集計: "
             f"segments={total_stats.get('segments', 0)}, "

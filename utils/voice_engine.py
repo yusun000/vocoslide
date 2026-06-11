@@ -106,7 +106,7 @@ class VoicevoxGenerator:
     def generate_segments(self, segments: List[Segment]) -> List[Dict[str, Any]]:
         """
         segments の順番に対応する結果を返す。
-        各要素: {duration, file, reused, cache_hit, synthesized}
+        各要素: {duration, file, reused, cache_hit, synthesized, kana}
         """
         self.reset_stats()
         self._stats["segments"] = len(segments)
@@ -144,12 +144,14 @@ class VoicevoxGenerator:
                 original_key = self._make_cache_key(seg.text, seg.params)
                 cache_path = self._get_cache_path(original_key)
                 if self.enable_disk_cache and cache_path.exists():
+                    query = self._create_audio_query(seg.text, seg.params)
                     duration = self._measure_duration(cache_path)
                     job_results[job_key] = {
                         "source_path": str(cache_path),
                         "duration": duration,
                         "cache_hit": True,
                         "synthesized": False,
+                        "kana": query.get("kana", ""),
                     }
                     self._stats["cache_hit"] += 1
                     continue
@@ -182,6 +184,7 @@ class VoicevoxGenerator:
                     "reused": info["cache_hit"] or (self.enable_in_memory_dedup and key_counts.get(key, 0) > 1),
                     "cache_hit": info["cache_hit"],
                     "synthesized": info["synthesized"],
+                    "kana": info.get("kana", ""),
                 }
             )
 
@@ -219,6 +222,7 @@ class VoicevoxGenerator:
             "duration": duration,
             "cache_hit": False,
             "synthesized": True,
+            "kana": query.get("kana", ""),
         }
 
     def _generate_one(self, text: str, output_path: str, params: VoiceParams) -> float:
