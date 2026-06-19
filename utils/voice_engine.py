@@ -10,7 +10,7 @@ import wave
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
 import requests
 
@@ -36,6 +36,36 @@ class Segment:
     subtitle: str = ""
 
 
+def load_reading_overrides(path: str | Path = "dict/reading_overrides.json") -> Dict[str, Any]:
+    p = Path(path)
+    if not p.exists():
+        return {}
+
+    with p.open("r", encoding="utf-8") as f:
+        data = json.load(f)
+
+    if not isinstance(data, dict):
+        raise ValueError(f"{p} の形式が不正です。JSONオブジェクトにしてください。")
+
+    return data
+
+
+def _normalize_kana_for_compare(text: str) -> str:
+    """
+    VOICEVOX kana と reading をゆるく比較するための正規化。
+    アクセント記号 ' や句切り / を除去し、長音はオ相当に寄せる。
+    """
+    text = text or ""
+    text = text.replace("'", "")
+    text = text.replace("/", "")
+    text = text.replace("ー", "オ")
+    return text
+
+
+def _accent_phrase_kana(accent_phrase: Dict[str, Any]) -> str:
+    return "".join(m.get("text", "") for m in accent_phrase.get("moras", []))
+
+
 class VoicevoxGenerator:
     """
     既存の generate_audio() を保ちつつ、
@@ -43,6 +73,7 @@ class VoicevoxGenerator:
     - 同一実行内の重複排除
     - ディスクキャッシュ
     - キャッシュ削除
+    - reading_overrides.json によるアクセント補正
     を提供する。
     """
 
@@ -57,6 +88,7 @@ class VoicevoxGenerator:
         cache_dir: str | Path = "temp/audio_cache",
         clear_cache_before_run: bool = False,
         verbose: bool = True,
+        reading_overrides_path: str | Path = "dict/reading_overrides.json",
     ):
         self.base_url = f"http://{host}:{port}"
         self.timeout_sec = timeout_sec
@@ -71,6 +103,11 @@ class VoicevoxGenerator:
         self._stats: Dict[str, Any] = {}
         self.session = requests.Session()
         self.session.trust_env = False
+
+        self.reading_overrides_path = Path(reading_overrides_path)
+        self.reading_overrides = load_reading_overrides(self.reading_overrides_path)
+        if self.reading_overrides:
+            self._log(f"読みアクセント補正を読み込みました: {self.reading_overrides_path}")
 
     def clear_cache(self) -> None:
         if self.cache_dir.exists():
@@ -117,13 +154,11 @@ class VoicevoxGenerator:
 
         started = time.perf_counter()
 
-        # 1. キー付与
         keyed_segments: List[tuple[str, Segment]] = []
         for seg in segments:
             key = self._make_cache_key(seg.text, seg.params)
             keyed_segments.append((key, seg))
 
-        # 2. 実行時重複排除の単位を決定
         jobs: Dict[str, Segment] = {}
         key_counts: Dict[str, int] = {}
         for key, seg in keyed_segments:
@@ -134,15 +169,19 @@ class VoicevoxGenerator:
                 jobs[f"{key}__{seg.index}"] = seg
 
         self._stats["unique_segments"] = len(jobs)
-        self._stats["reused_in_run"] = sum(c - 1 for c in key_counts.values() if c > 1) if self.enable_in_memory_dedup else 0
+        self._stats["reused_in_run"] = (
+            sum(c - 1 for c in key_counts.values() if c > 1)
+            if self.enable_in_memory_dedup
+            else 0
+        )
 
-        # 3. ジョブ実行
         job_results: Dict[str, Dict[str, Any]] = {}
         futures = {}
         with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
             for job_key, seg in jobs.items():
                 original_key = self._make_cache_key(seg.text, seg.params)
                 cache_path = self._get_cache_path(original_key)
+
                 if self.enable_disk_cache and cache_path.exists():
                     query = self._create_audio_query(seg.text, seg.params)
                     duration = self._measure_duration(cache_path)
@@ -155,6 +194,7 @@ class VoicevoxGenerator:
                     }
                     self._stats["cache_hit"] += 1
                     continue
+
                 futures[executor.submit(self._synthesize_to_cache_or_output, seg, original_key)] = job_key
 
             for future in as_completed(futures):
@@ -162,7 +202,6 @@ class VoicevoxGenerator:
                 job_results[job_key] = future.result()
                 self._stats["synthesized"] += 1
 
-        # 4. 各セグメントへ割り当て
         results: List[Dict[str, Any]] = []
         for key, seg in keyed_segments:
             lookup_key = key if self.enable_in_memory_dedup else f"{key}__{seg.index}"
@@ -171,7 +210,6 @@ class VoicevoxGenerator:
             dst = Path(seg.output_path)
             dst.parent.mkdir(parents=True, exist_ok=True)
 
-            # 既に同一ファイルならコピー不要
             if Path(src).resolve() != dst.resolve():
                 import shutil
                 shutil.copy2(src, dst)
@@ -181,7 +219,9 @@ class VoicevoxGenerator:
                     "duration": info["duration"],
                     "file": dst.name,
                     "path": str(dst),
-                    "reused": info["cache_hit"] or (self.enable_in_memory_dedup and key_counts.get(key, 0) > 1),
+                    "reused": info["cache_hit"] or (
+                        self.enable_in_memory_dedup and key_counts.get(key, 0) > 1
+                    ),
                     "cache_hit": info["cache_hit"],
                     "synthesized": info["synthesized"],
                     "kana": info.get("kana", ""),
@@ -241,6 +281,9 @@ class VoicevoxGenerator:
         )
         query_res.raise_for_status()
         query = query_res.json()
+
+        self._apply_reading_overrides_to_query(text, query)
+
         query["speedScale"] = params.speed_scale
         query["pitchScale"] = params.pitch_scale
         query["intonationScale"] = params.intonation_scale
@@ -249,6 +292,82 @@ class VoicevoxGenerator:
         query["postPhonemeLength"] = params.post_phoneme_length
         query["outputSamplingRate"] = params.output_sampling_rate
         return query
+
+    def _apply_reading_overrides_to_query(self, text: str, query: Dict[str, Any]) -> None:
+        """
+        dict/reading_overrides.json の指定により、VOICEVOXの accent_phrases を補正する。
+
+        形式例:
+        {
+          "長大橋": {
+            "reading": "チョーダイキョー",
+            "accent": 6
+          }
+        }
+
+        text は custom_dict 適用後の VOICEVOX入力になっていることがあるため、
+        surface または reading が含まれるかで対象判定する。
+        """
+        if not self.reading_overrides:
+            return
+
+        accent_phrases = query.get("accent_phrases")
+        if not isinstance(accent_phrases, list):
+            return
+
+        for surface, rule in self.reading_overrides.items():
+            if isinstance(rule, str):
+                rule = {"reading": rule}
+
+            if not isinstance(rule, dict):
+                continue
+
+            reading = str(rule.get("reading", "")).strip()
+            accent = rule.get("accent")
+
+            if not reading or accent is None:
+                continue
+
+            try:
+                accent = int(accent)
+            except (TypeError, ValueError):
+                self._log(f"reading_overrides の accent が数値ではありません: {surface}={accent}")
+                continue
+
+            if surface not in text and reading not in text:
+                continue
+
+            target_cmp = _normalize_kana_for_compare(reading)
+
+            for phrase in accent_phrases:
+                phrase_kana = _accent_phrase_kana(phrase)
+                phrase_cmp = _normalize_kana_for_compare(phrase_kana)
+
+                if target_cmp in phrase_cmp or phrase_cmp in target_cmp:
+                    mora_count = len(phrase.get("moras", []))
+                    if mora_count <= 0:
+                        continue
+
+                    # VOICEVOXのaccentは通常 1..mora_count。
+                    # 範囲外は丸める。
+                    fixed_accent = max(1, min(accent, mora_count))
+                    phrase["accent"] = fixed_accent
+
+                    mora_pitches = rule.get("mora_pitches")
+                    if isinstance(mora_pitches, list):
+                        moras = phrase.get("moras", [])
+                        
+                        for i, pitch in enumerate(mora_pitches):
+                            if i < len(moras):
+                                try:
+                                    moras[i]["pitch"] = float(pitch)
+                                except (TypeError, ValueError):
+                                    pass
+                
+                    self._log(
+                        f"アクセント補正: {surface} reading={reading} "
+                        f"phrase={phrase_kana} accent={fixed_accent}"
+                    )
 
     def _synthesis(self, query: Dict[str, Any], params: VoiceParams) -> bytes:
         synth_res = self.session.post(
@@ -275,6 +394,7 @@ class VoicevoxGenerator:
             "pre_phoneme_length": params.pre_phoneme_length,
             "post_phoneme_length": params.post_phoneme_length,
             "output_sampling_rate": params.output_sampling_rate,
+            "reading_overrides": self.reading_overrides,
         }
         raw = json.dumps(payload, ensure_ascii=False, sort_keys=True)
         return hashlib.sha256(raw.encode("utf-8")).hexdigest()
@@ -308,12 +428,13 @@ def parse_check_notes(file_path):
     with open(file_path, "r", encoding="utf-8") as f:
         content = f.read()
 
-    pages = re.split(r'--- PAGE_(\d+) ---', content)
+    pages = re.split(r"--- PAGE_(\d+) ---", content)
     page_data = {}
     for i in range(1, len(pages), 2):
         page_num = int(pages[i])
         text = pages[i + 1].strip()
         if text:
-            parts = [p.strip() for p in re.split(r'／／|//', text) if p.strip()]
+            parts = [p.strip() for p in re.split(r"／／|//", text) if p.strip()]
             page_data[page_num] = parts
     return page_data
+    
