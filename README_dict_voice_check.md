@@ -1,15 +1,16 @@
-# build_dict_voice_check.py 自動読み方調整パターン版
+# build_dict_voice_check.py 採用ワークフロー版
 
-vocoslide のカスタム辞書JSONを読み込み、以下を単語ごとに聴き比べできる静的HTMLページを生成します。
+vocoslide の `dict/custom_dict.json` から、読み上げ比較ページを生成する補助ツールです。
 
-- 辞書なし
-- カスタム辞書適用
-- 自動生成した読み方調整パターン
-- 手動で追加した読み方調整パターン
+この版では、単に聴き比べるだけでなく、採用結果を次のファイル候補として出力できます。
 
-あわせて、生成・マージ後の追加版JSONファイルも保存します。
+- `custom_dict.proposed.json`
+- `reading_overrides.proposed.json`
+- `dict_check_adoptions.json`
 
-## 対応する辞書形式
+## 基本方針
+
+vocoslide のカスタム辞書は、基本的に次の形式です。
 
 ```json
 {
@@ -19,7 +20,16 @@ vocoslide のカスタム辞書JSONを読み込み、以下を単語ごとに聴
 }
 ```
 
-キーが登録語、値がカスタム辞書で指定する読みです。
+この形式で直接反映できるのは、**登録語に対する読み** だけです。
+
+そのため、採用案ごとの扱いは次のように分けます。
+
+| 採用案 | 反映先 |
+|---|---|
+| 辞書なしが良い | `custom_dict.json` からその語を削除 |
+| カスタム辞書が良い | `custom_dict.json` にそのまま残す |
+| ひらがな化・カタカナ化・長音変換など | `custom_dict.json` の読みを更新 |
+| 区切り追加、文中確認、アクセント、mora_pitches | `reading_overrides.json` 候補として出力 |
 
 ## 基本実行
 
@@ -27,7 +37,7 @@ vocoslide のカスタム辞書JSONを読み込み、以下を単語ごとに聴
 python tools/build_dict_voice_check.py --input dict/custom_dict.json --out dict_check --speaker 3 --limit 100
 ```
 
-生成後、出力先には次のようなファイルが作られます。
+生成されるファイル例です。
 
 ```text
 dict_check/
@@ -35,148 +45,110 @@ dict_check/
   data.js
   manifest.csv
   reading_patterns.auto.json
+  reading_overrides.candidates.json
   audio/
 ```
 
-`reading_patterns.auto.json` が、読み方調整パターンの追加版JSONです。
+## 画面での採用
 
-## 自動生成される候補
+右側の聴き比べ欄で、各候補の横にある **この案を採用** を押します。
 
-読みごとに、以下のような候補を自動生成します。
+採用すると、その語は `OK` 扱いになります。
 
-| 候補 | 例 |
+採用先は候補ごとに表示されます。
+
+- `custom_dictから除去`
+- `custom_dict維持`
+- `custom_dictの読みを更新`
+- `reading_overridesへ反映`
+
+## 出力ボタン
+
+画面左側のボタンから、以下をダウンロードできます。
+
+| ボタン | 内容 |
 |---|---|
-| ひらがな化 | `エーアイ` → `えーあい` |
-| カタカナ化 | `ちょうふく` → `チョウフク` |
-| 長音を母音化 | `エーアイ` → `エエアイ` |
-| 母音連続を長音化 | `エエアイ` → `エーアイ` |
-| 区切り追加 | `エーアイ` → `エー、アイ。` |
-| 文中確認 | `重複は、ちょうふくと読みます。` |
+| 結果CSV | 確認結果の一覧 |
+| 採用結果JSON | 次回生成時に渡すための結果ファイル |
+| custom_dict候補 | 採用結果を反映したカスタム辞書候補 |
+| reading_overrides候補 | 採用した override 候補 |
 
-候補は「正解を推定する」ものではなく、VOICEVOXに渡す文字列の違いを聴き比べるための機械的な候補です。
+## 採用済みを次回生成対象から外す
 
-## 追加版JSONの例
+画面から `dict_check_adoptions.json` を保存して、次回実行時に渡します。
+
+```bash
+python tools/build_dict_voice_check.py \
+  --input dict/custom_dict.json \
+  --out dict_check_next \
+  --speaker 3 \
+  --results dict_check/dict_check_adoptions.json
+```
+
+`OK` かつ何らかの案を採用済みの語は、次回以降の音声生成対象から外れます。
+
+## 保留語に reading_overrides 候補を出す
+
+前回結果で `保留` にした語は、次回 `--results` を渡すと、既定で `reading_overrides` 候補が追加されます。
+
+生成される候補例です。
+
+- アクセント先頭
+- アクセント中央
+- アクセント末尾
+- ピッチ平坦
+- ピッチ下降
+- ピッチ上昇
+
+全語に対して override 候補を出したい場合は、次のようにします。
+
+```bash
+python tools/build_dict_voice_check.py \
+  --input dict/custom_dict.json \
+  --out dict_check \
+  --speaker 3 \
+  --include-override-candidates all
+```
+
+出さない場合は、次です。
+
+```bash
+python tools/build_dict_voice_check.py \
+  --input dict/custom_dict.json \
+  --out dict_check \
+  --speaker 3 \
+  --include-override-candidates none
+```
+
+## reading_overrides 候補について
+
+このツールが出力する `reading_overrides.proposed.json` は候補ファイルです。
+
+既存の `dict/reading_overrides.json` にそのまま上書きする前に、現在のvocoslide側の形式に合わせて確認してください。
+
+出力例です。
 
 ```json
 {
-  "AI": [
-    {
-      "label": "ひらがな化",
-      "reading": "えーあい"
-    },
-    {
-      "label": "長音を母音化",
-      "reading": "エエアイ"
-    },
-    {
-      "label": "区切り追加",
-      "text": "エー、アイ。"
-    }
-  ],
   "重複": [
     {
-      "label": "カタカナ化",
-      "reading": "チョウフク"
+      "surface": "重複",
+      "reading": "ちょうふく",
+      "accent": 2,
+      "label": "reading_overrides: アクセント中央"
     },
     {
-      "label": "文中確認",
-      "text": "重複は、ちょうふくと読みます。"
+      "surface": "重複",
+      "reading": "ちょうふく",
+      "mora_pitches": [5.2, 5.12, 5.04, 4.96],
+      "label": "reading_overrides: ピッチ下降"
     }
   ]
 }
 ```
-
-`reading` は `--pattern-template` に入れて合成されます。既定は `{reading}。` です。  
-`text` はそのままVOICEVOXに渡されます。
-
-## 手動パターンを併用する
-
-手動パターンJSONを指定すると、自動生成分とマージします。  
-手動指定は優先して先頭に入ります。
-
-```bash
-python tools/build_dict_voice_check.py \
-  --input dict/custom_dict.json \
-  --out dict_check \
-  --speaker 3 \
-  --patterns dict/reading_patterns.manual.json
-```
-
-手動パターンJSONの例です。
-
-```json
-{
-  "重複": [
-    {"label": "本来想定", "reading": "ちょうふく"},
-    {"label": "別読み確認", "reading": "じゅうふく"}
-  ],
-  "AI": [
-    {"label": "区切る", "text": "エー、アイ。"}
-  ]
-}
-```
-
-## 追加版JSONの保存先を変える
-
-```bash
-python tools/build_dict_voice_check.py \
-  --input dict/custom_dict.json \
-  --out dict_check \
-  --speaker 3 \
-  --auto-patterns-out dict/reading_patterns.generated.json
-```
-
-## 自動生成を止める
-
-手動パターンだけ使いたい場合は、次のようにします。
-
-```bash
-python tools/build_dict_voice_check.py \
-  --input dict/custom_dict.json \
-  --out dict_check \
-  --speaker 3 \
-  --no-auto-patterns \
-  --patterns dict/reading_patterns.manual.json
-```
-
-## パターン数を調整する
-
-1語あたりの候補数を変えるには、`--max-auto-patterns` を指定します。
-
-```bash
-python tools/build_dict_voice_check.py \
-  --input dict/custom_dict.json \
-  --out dict_check \
-  --speaker 3 \
-  --max-auto-patterns 8
-```
-
-## 聴き比べ画面
-
-HTML画面では、単語ごとに以下を再生できます。
-
-```text
-1. 辞書なし
-2. カスタム辞書
-3. 読み方調整候補1
-4. 読み方調整候補2
-...
-```
-
-キーボード操作もできます。
-
-| キー | 動作 |
-|---|---|
-| `1` | 辞書なしを再生 |
-| `2` | カスタム辞書を再生 |
-| `3` 以降 | 読み方調整候補を再生 |
-| `O` | OK |
-| `N` | NG |
-| `H` | 保留 |
-| `←` / `→` | 前後の語へ |
-| `/` | 検索欄へ |
 
 ## 注意
 
-このツールは、VOICEVOX ENGINEのユーザー辞書へ単語を登録するものではありません。  
-vocoslide のカスタム辞書で指定した読みと、機械的に作った読み方調整候補をVOICEVOXに渡して聴き比べるための補助ツールです。
+- このツールは VOICEVOX ENGINE のユーザー辞書を直接編集しません。
+- `custom_dict.json` に反映できるのは、基本的に「単語 → 読み」だけです。
+- 区切り、文中の特殊補正、アクセント、mora_pitches は `reading_overrides.json` 側で扱う候補として分けます。
