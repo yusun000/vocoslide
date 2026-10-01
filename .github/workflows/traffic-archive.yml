@@ -34,7 +34,7 @@ jobs:
       #   owner/repository の形式
       #
       - name: Checkout private traffic archive
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           repository: ${{ secrets.ARCHIVE_REPOSITORY }}
           token: ${{ secrets.ARCHIVE_TOKEN }}
