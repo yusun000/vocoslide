@@ -1,0 +1,316 @@
+name: Archive GitHub Traffic
+
+on:
+  # 毎日 10:17 JST 頃に実行
+  # GitHub Actions の cron は UTC
+  schedule:
+    - cron: "17 1 * * *"
+
+  # Actions画面から手動実行可能
+  workflow_dispatch:
+
+# 通常の GITHUB_TOKEN は読み取り専用
+permissions:
+  contents: read
+
+# 同じリポジトリで手動実行と定期実行が重なった場合の競合防止
+concurrency:
+  group: github-traffic-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  archive-traffic:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      # Traffic保存先のPrivateリポジトリを取得
+      #
+      # ARCHIVE_TOKEN:
+      #   保存先Privateリポジトリのみ
+      #   Contents: Read and write
+      #
+      # ARCHIVE_REPOSITORY:
+      #   owner/repository の形式
+      #
+      - name: Checkout private traffic archive
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ secrets.ARCHIVE_REPOSITORY }}
+          token: ${{ secrets.ARCHIVE_TOKEN }}
+          path: traffic-archive
+
+      # GitHub Traffic APIから直近14日分を取得し、
+      # Privateリポジトリ内の既存データへマージ
+      #
+      # TRAFFIC_TOKEN:
+      #   Traffic取得元リポジトリのみ
+      #   Administration: Read-only
+      #
+      - name: Fetch and archive traffic
+        env:
+          TRAFFIC_TOKEN: ${{ secrets.TRAFFIC_TOKEN }}
+          SOURCE_REPOSITORY: ${{ github.repository }}
+          SOURCE_REPOSITORY_NAME: ${{ github.event.repository.name }}
+        run: |
+          python3 <<'PY'
+          import csv
+          import json
+          import os
+          import textwrap
+          import urllib.error
+          import urllib.request
+          from pathlib import Path
+
+          source_repo = os.environ["SOURCE_REPOSITORY"]
+          repo_name = os.environ["SOURCE_REPOSITORY_NAME"]
+          token = os.environ["TRAFFIC_TOKEN"]
+
+          # Privateリポジトリ内の保存場所
+          #
+          # github-traffic-private/
+          # └── 元リポジトリ名/
+          #     ├── history.csv
+          #     └── README.md
+          #
+          out_dir = Path("traffic-archive") / repo_name
+          csv_path = out_dir / "history.csv"
+          summary_path = out_dir / "README.md"
+
+          out_dir.mkdir(parents=True, exist_ok=True)
+
+          def github_api(endpoint):
+              url = f"https://api.github.com/repos/{source_repo}/{endpoint}"
+
+              request = urllib.request.Request(
+                  url,
+                  headers={
+                      "Accept": "application/vnd.github+json",
+                      "Authorization": f"Bearer {token}",
+                      "X-GitHub-Api-Version": "2022-11-28",
+                      "User-Agent": "github-traffic-archive-action",
+                  },
+              )
+
+              try:
+                  with urllib.request.urlopen(
+                      request,
+                      timeout=30,
+                  ) as response:
+                      return json.load(response)
+
+              except urllib.error.HTTPError as exc:
+                  # Tokenやレスポンス本文はログに出さない
+                  raise RuntimeError(
+                      f"GitHub Traffic API request failed "
+                      f"(HTTP {exc.code})"
+                  ) from exc
+
+              except urllib.error.URLError as exc:
+                  raise RuntimeError(
+                      "GitHub Traffic API request failed"
+                  ) from exc
+
+          # GitHub側が保持している直近14日の日別データ
+          views_data = github_api("traffic/views?per=day")
+          clones_data = github_api("traffic/clones?per=day")
+
+          rows = {}
+
+          # 既存の長期履歴を読み込む
+          if csv_path.exists():
+              with csv_path.open(
+                  "r",
+                  encoding="utf-8",
+                  newline="",
+              ) as f:
+                  reader = csv.DictReader(f)
+
+                  required_columns = {
+                      "date",
+                      "views",
+                      "unique_visitors",
+                      "clones",
+                      "unique_cloners",
+                  }
+
+                  if not reader.fieldnames:
+                      raise RuntimeError(
+                          "Existing history.csv has no header"
+                      )
+
+                  if not required_columns.issubset(reader.fieldnames):
+                      raise RuntimeError(
+                          "Existing history.csv has an unexpected format"
+                      )
+
+                  for row in reader:
+                      rows[row["date"]] = {
+                          "date": row["date"],
+                          "views": int(row["views"]),
+                          "unique_visitors": int(
+                              row["unique_visitors"]
+                          ),
+                          "clones": int(row["clones"]),
+                          "unique_cloners": int(
+                              row["unique_cloners"]
+                          ),
+                      }
+
+          def empty_row(date):
+              return {
+                  "date": date,
+                  "views": 0,
+                  "unique_visitors": 0,
+                  "clones": 0,
+                  "unique_cloners": 0,
+              }
+
+          # 直近14日のViewsを更新
+          for item in views_data.get("views", []):
+              date = item["timestamp"][:10]
+
+              row = rows.setdefault(
+                  date,
+                  empty_row(date),
+              )
+
+              row["views"] = int(item["count"])
+              row["unique_visitors"] = int(item["uniques"])
+
+          # 直近14日のClonesを更新
+          for item in clones_data.get("clones", []):
+              date = item["timestamp"][:10]
+
+              row = rows.setdefault(
+                  date,
+                  empty_row(date),
+              )
+
+              row["clones"] = int(item["count"])
+              row["unique_cloners"] = int(item["uniques"])
+
+          sorted_rows = [
+              rows[key]
+              for key in sorted(rows)
+          ]
+
+          # CSVを保存
+          with csv_path.open(
+              "w",
+              encoding="utf-8",
+              newline="",
+          ) as f:
+              writer = csv.DictWriter(
+                  f,
+                  fieldnames=[
+                      "date",
+                      "views",
+                      "unique_visitors",
+                      "clones",
+                      "unique_cloners",
+                  ],
+              )
+
+              writer.writeheader()
+              writer.writerows(sorted_rows)
+
+          # Views / Clones は日別値を足して長期累計可能
+          total_views = sum(
+              row["views"]
+              for row in sorted_rows
+          )
+
+          total_clones = sum(
+              row["clones"]
+              for row in sorted_rows
+          )
+
+          if sorted_rows:
+              first_date = sorted_rows[0]["date"]
+              last_date = sorted_rows[-1]["date"]
+          else:
+              first_date = "-"
+              last_date = "-"
+
+          # Privateリポジトリ内だけで閲覧するサマリー
+          summary = f"""
+          # GitHub Traffic Archive
+
+          Repository: `{source_repo}`
+
+          ## 累計
+
+          | 項目 | 値 |
+          |---|---:|
+          | 記録開始 | {first_date} |
+          | 最終記録 | {last_date} |
+          | Views | {total_views:,} |
+          | Clones | {total_clones:,} |
+          | 記録日数 | {len(sorted_rows):,} |
+
+          ## 日別データ
+
+          [`history.csv`](history.csv)
+
+          | 列 | 内容 |
+          |---|---|
+          | `date` | 日付 |
+          | `views` | Views |
+          | `unique_visitors` | 日別 Unique visitors |
+          | `clones` | Clones |
+          | `unique_cloners` | 日別 Unique cloners |
+
+          ## Unique値について
+
+          `unique_visitors` と `unique_cloners` は
+          各日ごとのユニーク数です。
+
+          GitHub Traffic APIでは、日をまたいだ同一利用者を
+          識別できないため、全期間を通した真のUnique人数は
+          算出していません。
+
+          ViewsとClonesについては日別値を累積しています。
+
+          Data source: GitHub Repository Traffic API
+          """
+
+          summary_path.write_text(
+              textwrap.dedent(summary).lstrip(),
+              encoding="utf-8",
+          )
+
+          # Public ActionsログにはTraffic数値を出さない
+          print("Traffic archive data prepared successfully.")
+          PY
+
+      # Privateリポジトリだけを変更
+      - name: Commit traffic data to private repository
+        working-directory: traffic-archive
+        env:
+          REPO_NAME: ${{ github.event.repository.name }}
+        run: |
+          set -e
+
+          git config user.name "github-actions[bot]"
+          git config user.email \
+            "41898282+github-actions[bot]@users.noreply.github.com"
+
+          # 新規ファイルも検出できるよう、先にstageする
+          git add "$REPO_NAME"
+
+          if git diff --cached --quiet; then
+            echo "No traffic archive changes."
+            exit 0
+          fi
+
+          git commit -m "Update traffic archive"
+
+          # 複数の公開リポジトリから同じPrivateリポジトリへ
+          # 保存する場合のpush競合を減らす
+          BRANCH="$(git branch --show-current)"
+
+          git pull --rebase origin "$BRANCH"
+          git push origin "$BRANCH"
+
+          echo "Traffic archive updated successfully."
