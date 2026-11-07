@@ -1,5 +1,4 @@
-# build_dict_voice_check.py 採用ワークフロー版
-
+# build_dict_voice_check.py 
 vocoslide の `dict/custom_dict.json` から、読み上げ比較ページを生成する補助ツールです。
 
 この版では、単に聴き比べるだけでなく、採用結果を次のファイル候補として出力できます。
